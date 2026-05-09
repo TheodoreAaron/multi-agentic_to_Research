@@ -1,0 +1,18 @@
+.env
+.venv
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+Thumbs.db
+
+# local vector db / artifacts
+milvus_local*.db
+final_report.md
+
+# streamlit
+.streamlit/

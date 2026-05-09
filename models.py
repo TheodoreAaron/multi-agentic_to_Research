@@ -1,0 +1,19 @@
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional
+
+class SectionState(BaseModel):
+    """单个章节的状态管理"""
+    title: str = Field(description="章节标题")
+    research_data: str = Field(default="", description="该章节的原始研究数据")
+    rag_context: str = Field(default="", description="RAG 召回的关键上下文（用于压缩输入与提升相关性）")
+    draft: str = Field(default="", description="Analyst 撰写的章节草稿")
+    critique: str = Field(default="", description="Reviewer 给出的大修指令")
+    is_approved: bool = Field(default=False, description="是否通过了 Reviewer 的审查")
+
+class ResearchState(BaseModel):
+    """全局工作流状态管理"""
+    topic: str = Field(description="研究主题")
+    sections: Dict[str, SectionState] = Field(default_factory=dict, description="所有章节的字典映射")
+    revision_count: int = Field(default=0, description="全局迭代次数")
+    final_report: str = Field(default="", description="Editor 生成的最终报告")
+    conflict_resolutions: str = Field(default="", description="冲突处理记录")

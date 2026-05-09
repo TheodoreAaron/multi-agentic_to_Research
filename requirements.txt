@@ -1,0 +1,7 @@
+langgraph
+tavily-python
+pymilvus
+sentence-transformers
+langchain-openai
+aiohttp
+streamlit
