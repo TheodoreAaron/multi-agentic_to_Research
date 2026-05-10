@@ -176,10 +176,11 @@ async def run_editor_async(topic: str, drafts: Dict[str, str], conflict_resoluti
     system_prompt = """你是一个资深的报告编辑（Editor Agent）。
 你的任务是将多篇章节草稿整合为一篇完整的 Markdown 格式长报告。
 要求：
-1. 报告必须包含自动生成的目录（Table of Contents, TOC）。
-2. 内容排版要美观，层级清晰。
-3. 在报告末尾，根据各章节中出现的数据引用（如 [数据源1]），提取并生成统一的“参考资料”列表。
-4. 润色段落间的过渡，使整篇文章读起来流畅自然。"""
+1. 报告必须包含自动生成的目录（Table of Contents, TOC），使用 Markdown 锚点链接。
+2. 内容排版要美观，层级清晰，段落之间用空行分隔，确保 Markdown 渲染后换行正常。
+3. 保留草稿中已有的引用标记（如 [1]、[2] 等），不要修改或删除它们。
+4. 润色段落间的过渡，使整篇文章读起来流畅自然。
+5. 不要在报告末尾添加\"参考资料\"章节，这将在后续由系统自动生成。"""
 
     drafts_text = ""
     for section_title, content in drafts.items():

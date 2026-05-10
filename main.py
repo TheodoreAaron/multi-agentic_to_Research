@@ -5,10 +5,13 @@ import json
 import re
 import uuid
 
-# 导入刚才编写的 Agents 和 Tools
 from agents import run_planner_async, run_analyst_async, run_reviewer_async, run_editor_async
 from tools import web_search, MilvusRAGHelper
 from models import ResearchState, SectionState
+from logger import (
+    append_planner_log, append_researcher_log, append_analyst_log,
+    append_reviewer_log, append_editor_log, init_log_file, _ensure_log_folder
+)
 
 def _safe_collection_name(prefix: str, title: str, max_len: int = 60) -> str:
     safe = re.sub(r"[^a-zA-Z0-9_]+", "_", title).strip("_")
@@ -99,16 +102,20 @@ def _lexical_rag_retrieve(docs: List[str], query: str, top_k: int = 6) -> List[s
 async def planner_node(state: ResearchState) -> ResearchState:
     print("\n--> 节点执行: planner")
     topic = state.topic
-    
+
     if not state.sections:
         print(f"    [Planner] 正在为主题 '{topic}' 动态生成研究大纲...")
         outline = await run_planner_async(topic)
         print(f"    [Planner] 成功生成大纲: {outline}")
-        
-        # 初始化 SectionState
+
         for sec_title in outline:
             state.sections[sec_title] = SectionState(title=sec_title)
-            
+
+        try:
+            append_planner_log(topic, topic, outline)
+        except Exception as e:
+            print(f"    [Planner] 日志记录失败: {e}")
+
     return state
 
 # 真实的 Researcher 节点：并发调用 Tavily 进行全网检索
@@ -186,7 +193,13 @@ async def researcher_node(state: ResearchState) -> ResearchState:
             top_k = min(6, len(docs)) if docs else 0
             retrieved = _lexical_rag_retrieve(docs, query=f"{topic} {sec_title}", top_k=top_k) if top_k else []
             sec.rag_context = "\n\n---\n\n".join(retrieved)
-            
+
+    try:
+        for sec_title, raw_results, formatted_data in results:
+            append_researcher_log(topic, topic, sec_title, raw_results, formatted_data)
+    except Exception as e:
+        print(f"    [Researcher] 日志记录失败: {e}")
+
     return state
 
 # Analyst 节点：并行处理所有未通过的章节
@@ -224,10 +237,16 @@ async def analyst_node(state: ResearchState) -> ResearchState:
     for sec_title, draft in results:
         sec = state.sections[sec_title]
         sec.draft = draft
-        # 一旦重写完成，清除该章节旧的 critique 指令
         sec.critique = ""
-        sec.is_approved = False # 等待新一轮 review
-            
+        sec.is_approved = False
+
+    try:
+        for sec_title, draft in results:
+            sec = state.sections[sec_title]
+            append_analyst_log(topic, topic, sec_title, sec.research_data, draft, sec.critique)
+    except Exception as e:
+        print(f"    [Analyst] 日志记录失败: {e}")
+
     return state
 
 # Reviewer 节点：并行审查所有新草稿
@@ -271,23 +290,118 @@ async def reviewer_node(state: ResearchState) -> ResearchState:
     if not all_approved:
         state.revision_count += 1
         print(f"    [Reviewer] 存在未通过的章节，当前总迭代次数: {state.revision_count}")
-        
+
+    try:
+        for sec_title, res in results:
+            sec = state.sections[sec_title]
+            append_reviewer_log(topic, topic, sec_title, sec.draft, res.get("is_approved", False), res.get("feedback", ""), sec.research_data)
+    except Exception as e:
+        print(f"    [Reviewer] 日志记录失败: {e}")
+
     return state
+
+def _parse_all_sources(sections: Dict[str, Any]) -> tuple:
+    source_list: List[Dict[str, str]] = []
+    local_to_global: Dict[str, str] = {}
+    global_counter = 0
+    for sec_title, sec in sections.items():
+        rd = getattr(sec, 'research_data', '') or ''
+        blocks = re.split(r'\n(?=\[数据源\d+\])', rd)
+        for block in blocks:
+            match = re.match(r'\[(数据源\d+)\]\s*标题:\s*(.+?)(?:\n|$)', block)
+            if not match:
+                continue
+            local_id = match.group(1)
+            source_title = match.group(2).strip()
+            url_match = re.search(r'来源链接:\s*(https?://\S+)', block)
+            source_url = url_match.group(1).strip() if url_match else ''
+            global_counter += 1
+            global_id = str(global_counter)
+            mapping_key = f"{sec_title}|||{local_id}"
+            local_to_global[mapping_key] = global_id
+            source_list.append({
+                'id': global_id,
+                'title': source_title,
+                'url': source_url,
+                'section': sec_title
+            })
+    return source_list, local_to_global
+
+
+def _normalize_citations_in_drafts(drafts: Dict[str, str], sections: Dict[str, Any]) -> Dict[str, str]:
+    _, local_to_global = _parse_all_sources(sections)
+    normalized = {}
+    for sec_title, draft in drafts.items():
+        text = draft
+        for mapping_key, global_id in local_to_global.items():
+            map_sec, map_local = mapping_key.split('|||', 1)
+            if map_sec != sec_title:
+                continue
+            text = re.sub(r'\[' + re.escape(map_local) + r'\]', f'[{global_id}]', text)
+        normalized[sec_title] = text
+    return normalized
+
+
+def _replace_references_section(report: str, sections: Dict[str, Any]) -> str:
+    source_list, _ = _parse_all_sources(sections)
+    if not source_list:
+        return report
+
+    lines: List[str] = []
+    lines.append('')
+    lines.append('---')
+    lines.append('')
+    lines.append('## 参考资料')
+    lines.append('')
+
+    for src in source_list:
+        sid = src['id']
+        title = src['title']
+        url = src['url']
+        section = src['section']
+        if url:
+            lines.append(f"- **[{sid}]** [{title}]({url})")
+        else:
+            lines.append(f"- **[{sid}]** {title}")
+        lines.append(f'  *章节：{section}*')
+        lines.append('')
+    lines.append('')
+
+    new_ref_block = '\n'.join(lines)
+
+    ref_pattern = r'\n*#{1,3}\s*参考资料\s*\n.*?(?=\n#{1,3}\s|\Z)'
+    ref_match = re.search(ref_pattern, report, re.DOTALL | re.IGNORECASE)
+    if ref_match:
+        report = report[:ref_match.start()].rstrip() + '\n' + new_ref_block + '\n' + report[ref_match.end():].lstrip()
+    else:
+        report = report.rstrip() + '\n' + new_ref_block + '\n'
+
+    return report
+
 
 # Editor 节点
 async def editor_node(state: ResearchState) -> ResearchState:
     print("\n--> 节点执行: editor")
     topic = state.topic
-    
-    # 提取所有草稿
+
     drafts = {title: sec.draft for title, sec in state.sections.items() if sec.draft}
+
+    drafts = _normalize_citations_in_drafts(drafts, state.sections)
+
     conflict_resolutions = state.conflict_resolutions
-    
+
     print(f"    [Editor] 正在整合 {len(drafts)} 个章节并生成最终报告...")
     final_report = await run_editor_async(topic, drafts, conflict_resolutions)
+
+    final_report = _replace_references_section(final_report, state.sections)
+
     state.final_report = final_report
-    
-    # 移除这里的本地文件 I/O，保持节点的纯净性
+
+    try:
+        append_editor_log(topic, topic, final_report, len(drafts))
+    except Exception as e:
+        print(f"    [Editor] 日志记录失败: {e}")
+
     print("    [Editor] 最终报告整合完毕，等待外部导出。")
     return state
 

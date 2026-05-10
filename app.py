@@ -2,6 +2,7 @@ import streamlit as st
 import asyncio
 from main import app as graph_app
 from models import ResearchState
+from logger import append_workflow_summary
 
 # 页面配置
 st.set_page_config(page_title="DeepResearch-MAS", page_icon="🧠", layout="wide")
@@ -98,11 +99,18 @@ if start_btn:
         # 运行异步图逻辑
         with st.spinner("系统初始化中..."):
             final_result = asyncio.run(run_workflow(topic))
-        
-        # 渲染最终报告 (兼容字典和对象)
+
         report_md = ""
         if final_result:
             report_md = getattr(final_result, 'final_report', final_result.get('final_report', ''))
+            sections = getattr(final_result, 'sections', final_result.get('sections', {}))
+            revision_count = getattr(final_result, 'revision_count', final_result.get('revision_count', 0))
+
+            try:
+                append_workflow_summary(topic, topic, len(sections), revision_count, len(report_md))
+                st.toast(f"节点日志已保存到 Log 文件夹（{topic}.md）", icon="📝")
+            except Exception as e:
+                st.warning(f"日志保存失败: {e}")
             
         if report_md:
             st.divider()
