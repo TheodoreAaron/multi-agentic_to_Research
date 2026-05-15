@@ -5,8 +5,9 @@ import json
 import re
 import uuid
 
-from agents import run_planner_async, run_analyst_async, run_reviewer_async, run_editor_async
-from tools import web_search, MilvusRAGHelper
+from agents import run_planner_async, run_analyst_async, run_reviewer_async, run_editor_async, run_researcher_async
+from ragas_evaluator import RagasEvaluationError, evaluate_faithfulness
+from tools import MilvusRAGHelper
 from models import ResearchState, SectionState
 from logger import (
     append_planner_log, append_researcher_log, append_analyst_log,
@@ -118,47 +119,34 @@ async def planner_node(state: ResearchState) -> ResearchState:
 
     return state
 
-# 真实的 Researcher 节点：并发调用 Tavily 进行全网检索
 async def researcher_node(state: ResearchState) -> ResearchState:
-    print("\n--> 节点执行: researcher (Async Parallel)")
+    print("\n--> 节点执行: researcher (ReAct Multi-Hop)")
     topic = state.topic
-    
-    # 找出还没有数据的章节
+
     sections_to_search = [title for title, sec in state.sections.items() if not sec.research_data]
-    
+
     if not sections_to_search:
         print("    [Researcher] 所有章节均已有基础研究数据。")
         return state
-        
-    print(f"    [Researcher] 正在并发联网检索章节: {sections_to_search}")
-    
+
+    print(f"    [Researcher] ReAct 多跳搜索启动，目标章节: {sections_to_search}")
+
     async def search_section(sec_title: str):
         query = f"{topic} {sec_title}"
         try:
-            # TODO: 后续优化可在此处引入 RAG 摘要机制，减少 Token 消耗
-            results = await asyncio.to_thread(web_search, query, max_results=10)
-            
-            formatted_data = f"以下是关于【{sec_title}】的真实联网搜索结果：\n\n"
-            for i, res in enumerate(results):
-                title = res.get('title', '无标题')
-                content = res.get('content', '无摘要内容')
-                url = res.get('url', '无链接')
-                formatted_data += f"[数据源{i+1}] 标题: {title}\n内容: {content}\n来源链接: {url}\n\n"
-            
-            return sec_title, results, formatted_data
+            raw_results, formatted_data = await run_researcher_async(topic, sec_title)
+            return sec_title, raw_results, formatted_data
         except Exception as e:
-            print(f"    [Researcher] 章节 '{sec_title}' 检索失败: {e}")
+            print(f"    [Researcher] 章节 '{sec_title}' ReAct 检索失败: {e}")
             return sec_title, [], f"关于【{sec_title}】的联网检索失败，请依赖大模型的内部知识进行分析。"
 
     results = await asyncio.gather(*(search_section(sec) for sec in sections_to_search))
 
-    # 先落盘原始资料
     raw_results_map: Dict[str, List[Dict[str, Any]]] = {}
     for sec_title, raw_results, formatted_data in results:
         raw_results_map[sec_title] = raw_results
         state.sections[sec_title].research_data = formatted_data
 
-    # 再基于原始资料做 RAG 召回，压缩输入、提升相关性
     try:
         rag_db = f"./milvus_local_{uuid.uuid4().hex}.db"
         rag = MilvusRAGHelper(db_path=rag_db)
@@ -179,12 +167,10 @@ async def researcher_node(state: ResearchState) -> ResearchState:
             rag.init_collection(collection_name)
             rag.add_documents(collection_name, docs)
 
-            # top_k 可按需要调整：资料变多后优先把输入压缩到可控体量
             top_k = min(6, len(docs))
             retrieved = rag.search(collection_name, query=f"{topic} {sec_title}", top_k=top_k)
             sec.rag_context = "\n\n---\n\n".join(retrieved)
     except Exception as e:
-        # RAG 失败（常见：embedding 模型不可用/无法下载），降级为 lexical RAG，不影响主流程运行
         print(f"    [Researcher] 向量 RAG 召回失败，降级为 lexical RAG（原因: {e}）")
         for sec_title in sections_to_search:
             sec = state.sections[sec_title]
@@ -379,6 +365,19 @@ def _replace_references_section(report: str, sections: Dict[str, Any]) -> str:
     return report
 
 
+def _build_evaluation_contexts(sections: Dict[str, Any], max_contexts: int = 20, max_chars: int = 1200) -> List[str]:
+    contexts: List[str] = []
+    for sec_title, sec in sections.items():
+        preferred_context = getattr(sec, "rag_context", "") or getattr(sec, "research_data", "")
+        for chunk in _chunk_text(preferred_context, chunk_size=max_chars, overlap=0):
+            cleaned = chunk.strip()
+            if cleaned:
+                contexts.append(f"章节：{sec_title}\n{cleaned}")
+            if len(contexts) >= max_contexts:
+                return contexts
+    return contexts
+
+
 # Editor 节点
 async def editor_node(state: ResearchState) -> ResearchState:
     print("\n--> 节点执行: editor")
@@ -403,6 +402,28 @@ async def editor_node(state: ResearchState) -> ResearchState:
         print(f"    [Editor] 日志记录失败: {e}")
 
     print("    [Editor] 最终报告整合完毕，等待外部导出。")
+    return state
+
+
+async def ragas_evaluator_node(state: ResearchState) -> ResearchState:
+    print("\n--> 节点执行: ragas_evaluator")
+    contexts = _build_evaluation_contexts(state.sections)
+    try:
+        state.faithfulness_score = await evaluate_faithfulness(
+            user_input=state.topic,
+            response=state.final_report,
+            retrieved_contexts=contexts,
+        )
+        state.faithfulness_error = ""
+        print(f"    [RAGAS] Faithfulness 评估完成: {state.faithfulness_score:.4f}")
+    except RagasEvaluationError as e:
+        state.faithfulness_score = None
+        state.faithfulness_error = str(e)
+        print(f"    [RAGAS] Faithfulness 评估失败: {e}")
+    except Exception as e:
+        state.faithfulness_score = None
+        state.faithfulness_error = f"RAGAS 评估运行异常: {e}"
+        print(f"    [RAGAS] Faithfulness 评估异常: {e}")
     return state
 
 # 条件路由逻辑
@@ -430,6 +451,14 @@ def should_revise(state: ResearchState) -> str:
     print(f"    [条件路由] 所有章节审查通过，前往 editor")
     return "editor"
 
+
+def should_run_ragas_evaluation(state: ResearchState) -> str:
+    if state.enable_ragas_evaluation:
+        print("    [条件路由] 已开启 RAGAS 评估，前往 ragas_evaluator")
+        return "ragas_evaluator"
+    print("    [条件路由] 未开启 RAGAS 评估，结束流程")
+    return "end"
+
 # ==========================================
 # 组装图并运行
 # ==========================================
@@ -440,6 +469,7 @@ workflow.add_node("researcher", researcher_node)
 workflow.add_node("analyst", analyst_node)
 workflow.add_node("reviewer", reviewer_node)
 workflow.add_node("editor", editor_node)
+workflow.add_node("ragas_evaluator", ragas_evaluator_node)
 
 workflow.add_edge(START, "planner")
 workflow.add_edge("planner", "researcher")
@@ -455,7 +485,15 @@ workflow.add_conditional_edges(
     }
 )
 
-workflow.add_edge("editor", END)
+workflow.add_conditional_edges(
+    "editor",
+    should_run_ragas_evaluation,
+    {
+        "ragas_evaluator": "ragas_evaluator",
+        "end": END
+    }
+)
+workflow.add_edge("ragas_evaluator", END)
 
 # 编译图结构
 app = workflow.compile()

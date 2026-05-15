@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional
+from typing import Dict, Optional
 
 class SectionState(BaseModel):
     """单个章节的状态管理"""
@@ -17,3 +17,6 @@ class ResearchState(BaseModel):
     revision_count: int = Field(default=0, description="全局迭代次数")
     final_report: str = Field(default="", description="Editor 生成的最终报告")
     conflict_resolutions: str = Field(default="", description="冲突处理记录")
+    enable_ragas_evaluation: bool = Field(default=False, description="是否在本次流程中运行 RAGAS 自动化评估")
+    faithfulness_score: Optional[float] = Field(default=None, description="RAGAS Faithfulness 指标分数")
+    faithfulness_error: str = Field(default="", description="RAGAS Faithfulness 评估失败信息")

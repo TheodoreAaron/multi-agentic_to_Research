@@ -4,6 +4,13 @@ from main import app as graph_app
 from models import ResearchState
 from logger import append_workflow_summary
 
+
+def state_get(state, key, default=None):
+    if isinstance(state, dict):
+        return state.get(key, default)
+    return getattr(state, key, default)
+
+
 # 页面配置
 st.set_page_config(page_title="DeepResearch-MAS", page_icon="🧠", layout="wide")
 
@@ -15,6 +22,11 @@ with st.sidebar:
     st.write("欢迎使用 DeepResearch-MAS 多智能体系统！")
     
     topic = st.text_input("请输入研究主题 (Topic)", value="DeepResearch-MAS 架构分析")
+    enable_ragas_evaluation = st.checkbox(
+        "开启 RAGAS Faithfulness 评估",
+        value=False,
+        help="开启后会在本次调研流程生成最终研报后实际运行 RAGAS Faithfulness 评估；关闭时不会运行评估程序。"
+    )
     start_btn = st.button("🚀 开始生成", type="primary", use_container_width=True)
     
     st.divider()
@@ -25,14 +37,15 @@ with st.sidebar:
     3. **Analyst (并行)**: 分章节撰写草稿
     4. **Reviewer (并行)**: 严苛审查打回
     5. **Editor**: 最终整合排版
+    6. **RAGAS Evaluator (可选)**: Faithfulness 自动化评估
     """)
 
 # ==========================================
 # 异步执行函数 (用于流式捕获节点状态)
 # ==========================================
-async def run_workflow(topic: str):
+async def run_workflow(topic: str, enable_ragas_evaluation: bool = False):
     # 使用重构后的面向对象 State
-    initial_state = ResearchState(topic=topic)
+    initial_state = ResearchState(topic=topic, enable_ragas_evaluation=enable_ragas_evaluation)
 
     # 创建一个状态容器占位符
     status_container = st.empty()
@@ -49,15 +62,15 @@ async def run_workflow(topic: str):
             if node_name == "planner":
                 # state_updates 现在是一个 ResearchState 对象 (由于 LangGraph 的行为，可能是字典或对象)
                 # 兼容字典和对象访问
-                sections = getattr(state_updates, 'sections', state_updates.get('sections', {}))
+                sections = state_get(state_updates, 'sections', {})
                 msg = f"🗓️ **Planner** 节点执行完毕。动态生成大纲：{list(sections.keys())}"
             elif node_name == "researcher":
                 msg = "🔍 **Researcher** 节点执行完毕。真实全网数据抓取完成！"
             elif node_name == "analyst":
                 msg = "✍️ **Analyst** 节点执行完毕 (并行)。正在针对未通过章节进行撰写/重写..."
             elif node_name == "reviewer":
-                rev_count = getattr(state_updates, 'revision_count', state_updates.get('revision_count', 0))
-                sections = getattr(state_updates, 'sections', state_updates.get('sections', {}))
+                rev_count = state_get(state_updates, 'revision_count', 0)
+                sections = state_get(state_updates, 'sections', {})
                 
                 # 找出未通过的章节
                 failed_sections = [title for title, sec in sections.items() if (hasattr(sec, 'is_approved') and not sec.is_approved) or (isinstance(sec, dict) and not sec.get('is_approved'))]
@@ -68,6 +81,13 @@ async def run_workflow(topic: str):
                     msg = "✅ **Reviewer** 审查通过！所有章节数据支撑充分，无逻辑矛盾。"
             elif node_name == "editor":
                 msg = "✨ **Editor** 节点执行完毕。最终长报告整合完成！"
+            elif node_name == "ragas_evaluator":
+                score = state_get(state_updates, 'faithfulness_score')
+                error = state_get(state_updates, 'faithfulness_error', '')
+                if score is not None:
+                    msg = f"📊 **RAGAS Evaluator** 执行完毕。Faithfulness = {score:.4f}"
+                else:
+                    msg = f"⚠️ **RAGAS Evaluator** 执行失败：{error}"
             else:
                 msg = f"🟢 **{node_name}** 执行完毕。"
             
@@ -78,7 +98,7 @@ async def run_workflow(topic: str):
                 with st.status(f"当前状态流转：{node_name.capitalize()} 节点", expanded=True) as status:
                     for log in log_messages:
                         st.write(log)
-                    if node_name == "editor":
+                    if node_name == "ragas_evaluator" or (node_name == "editor" and not enable_ragas_evaluation):
                         status.update(label="🎉 报告生成完毕！", state="complete", expanded=False)
                     else:
                         status.update(label=f"正在运行... ({node_name})", state="running")
@@ -98,13 +118,15 @@ if start_btn:
         
         # 运行异步图逻辑
         with st.spinner("系统初始化中..."):
-            final_result = asyncio.run(run_workflow(topic))
+            final_result = asyncio.run(run_workflow(topic, enable_ragas_evaluation))
 
         report_md = ""
         if final_result:
-            report_md = getattr(final_result, 'final_report', final_result.get('final_report', ''))
-            sections = getattr(final_result, 'sections', final_result.get('sections', {}))
-            revision_count = getattr(final_result, 'revision_count', final_result.get('revision_count', 0))
+            report_md = state_get(final_result, 'final_report', '')
+            sections = state_get(final_result, 'sections', {})
+            revision_count = state_get(final_result, 'revision_count', 0)
+            faithfulness_score = state_get(final_result, 'faithfulness_score')
+            faithfulness_error = state_get(final_result, 'faithfulness_error', '')
 
             try:
                 append_workflow_summary(topic, topic, len(sections), revision_count, len(report_md))
@@ -115,6 +137,12 @@ if start_btn:
         if report_md:
             st.divider()
             st.subheader("2. 最终研报展示区")
+
+            if enable_ragas_evaluation:
+                if faithfulness_score is not None:
+                    st.metric("RAGAS Faithfulness", f"{faithfulness_score:.4f}")
+                else:
+                    st.warning(f"RAGAS Faithfulness 评估未产出分数：{faithfulness_error}")
             
             # 下载按钮
             st.download_button(

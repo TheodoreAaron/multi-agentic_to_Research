@@ -1,22 +1,20 @@
 import os
 import json
 import asyncio
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from dotenv import load_dotenv
 
-# 加载 .env 文件中的环境变量
+from tools import tool_manager, web_search
+
 load_dotenv()
 
-# 如果使用 DeepSeek 官方 API，URL 通常是 https://api.deepseek.com/v1 或类似。
-# 请根据您实际的 API 服务商配置 BASE_URL 和 API_KEY
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "your-deepseek-api-key")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 
-# 初始化 ChatOpenAI，指向 DeepSeek v4 模型
 llm = ChatOpenAI(
-    model="deepseek-chat",  # DeepSeek V3/V4 常用模型标识，具体视服务商而定
+    model="deepseek-chat",
     api_key=DEEPSEEK_API_KEY,
     base_url=DEEPSEEK_API_BASE,
     temperature=0.3
@@ -205,6 +203,123 @@ async def run_editor_async(topic: str, drafts: Dict[str, str], conflict_resoluti
     
     response = await llm.ainvoke(messages)
     return response.content
+
+REACT_SYSTEM_PROMPT = """你是一个深度研究搜索智能体（Researcher Agent），遵循 ReAct（Reasoning + Acting）范式。
+你的任务是通过多轮迭代搜索，为特定研究章节收集全面、深入的网络资料。
+
+工作流程：
+1. 分析当前已收集的资料，识别信息缺口
+2. 制定新的搜索查询，从不同角度深入挖掘
+3. 当你认为资料足够充分时（通常 2-4 轮搜索后），输出结束指令
+
+要求：
+- 每轮只执行一次搜索，查询应具体且与前几轮不重复
+- 优先从不同维度切入：定义背景 → 技术细节 → 案例数据 → 观点争议 → 最新进展
+- 查询语言请使用中文（如果主题是中文语境）或英文
+
+输出格式（纯 JSON，不要 Markdown 代码块）：
+- 继续搜索：{"action": "search", "query": "你的搜索查询词"}
+- 结束搜索：{"action": "finish", "summary": "简要总结已收集资料的关键发现"}"""
+
+
+async def run_researcher_async(topic: str, section_title: str, max_hops: int = 4) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    ReAct Agent: 多跳搜索研究器
+    通过 Reasoning + Acting 循环进行多轮深层搜索，逐步深入主题的各维度。
+    max_hops: 最大搜索轮数（默认 4，即最多 4 次搜索）
+    返回: (原始搜索结果列表, 格式化后的研究数据字符串)
+    """
+    all_results: List[Dict[str, Any]] = []
+    conversation: List[Any] = [
+        SystemMessage(content=REACT_SYSTEM_PROMPT),
+        HumanMessage(content=f"研究主题: {topic}\n当前章节: {section_title}\n请开始第一轮搜索，从最核心的概念或背景信息入手。")
+    ]
+
+    for hop in range(max_hops):
+        print(f"    [ReAct] 第 {hop + 1}/{max_hops} 轮推理...")
+
+        try:
+            response = await llm.ainvoke(conversation)
+        except Exception as e:
+            print(f"    [ReAct] LLM 调用失败: {e}")
+            break
+
+        content = response.content.strip()
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+
+        try:
+            decision = json.loads(content)
+        except json.JSONDecodeError:
+            print(f"    [ReAct] JSON 解析失败，原始输出: {content[:200]}...")
+            continue
+
+        action = decision.get("action", "")
+
+        if action == "finish":
+            summary = decision.get("summary", "")
+            print(f"    [ReAct] Agent 决定结束搜索。总结: {summary[:100]}...")
+            break
+
+        elif action == "search":
+            query = decision.get("query", "")
+            if not query:
+                print(f"    [ReAct] 搜索动作为空 query，跳过")
+                continue
+
+            print(f"    [ReAct] 执行搜索: {query}")
+            try:
+                results = await asyncio.to_thread(web_search, query, max_results=5)
+            except Exception as e:
+                print(f"    [ReAct] 搜索失败: {e}")
+                observation = f"搜索 '{query}' 执行失败: {str(e)}"
+                conversation.append(AIMessage(content=content))
+                conversation.append(HumanMessage(content=f"[观察结果]\n{observation}"))
+                continue
+
+            all_results.extend(results)
+
+            observation_parts = [f"搜索结果（共 {len(results)} 条）:"]
+            for i, res in enumerate(results):
+                title = res.get('title', '无标题')
+                snippet = res.get('content', '无摘要')[:300]
+                url = res.get('url', '')
+                observation_parts.append(f"[结果{i+1}] {title}\n  {snippet}\n  链接: {url}")
+            observation = "\n".join(observation_parts)
+
+            conversation.append(AIMessage(content=content))
+            conversation.append(HumanMessage(content=f"[观察结果]\n{observation}\n\n请分析以上结果，决定下一步：是继续搜索新角度，还是资料已充足可以结束？"))
+        else:
+            print(f"    [ReAct] 未知动作: {action}")
+            break
+
+    source_index = 1
+    formatted_parts = [f"以下是关于【{section_title}】的多跳深度搜索结果（共 {len(all_results)} 条原始资料）：\n"]
+    seen_urls = set()
+    for res in all_results:
+        url = res.get('url', '')
+        if url and url in seen_urls:
+            continue
+        if url:
+            seen_urls.add(url)
+        title = res.get('title', '无标题')
+        content = res.get('content', '无摘要内容')
+        formatted_parts.append(
+            f"[数据源{source_index}] 标题: {title}\n"
+            f"内容: {content}\n"
+            f"来源链接: {url}\n"
+        )
+        source_index += 1
+
+    formatted_data = "\n".join(formatted_parts)
+    print(f"    [ReAct] 多跳搜索完成，共执行 {min(hop + 1, max_hops)} 轮，收集 {source_index - 1} 条去重资料。")
+    return all_results, formatted_data
+
 
 if __name__ == "__main__":
     print("Agent 模块已加载，可被 main.py 调用。")
