@@ -286,33 +286,6 @@ async def reviewer_node(state: ResearchState) -> ResearchState:
 
     return state
 
-def _parse_all_sources(sections: Dict[str, Any]) -> tuple:
-    source_list: List[Dict[str, str]] = []
-    local_to_global: Dict[str, str] = {}
-    global_counter = 0
-    for sec_title, sec in sections.items():
-        rd = getattr(sec, 'research_data', '') or ''
-        blocks = re.split(r'\n(?=\[数据源\d+\])', rd)
-        for block in blocks:
-            match = re.match(r'\[(数据源\d+)\]\s*标题:\s*(.+?)(?:\n|$)', block)
-            if not match:
-                continue
-            local_id = match.group(1)
-            source_title = match.group(2).strip()
-            url_match = re.search(r'来源链接:\s*(https?://\S+)', block)
-            source_url = url_match.group(1).strip() if url_match else ''
-            global_counter += 1
-            global_id = str(global_counter)
-            mapping_key = f"{sec_title}|||{local_id}"
-            local_to_global[mapping_key] = global_id
-            source_list.append({
-                'id': global_id,
-                'title': source_title,
-                'url': source_url,
-                'section': sec_title
-            })
-    return source_list, local_to_global
-
 
 def _normalize_citations_in_drafts(drafts: Dict[str, str], sections: Dict[str, Any]) -> Dict[str, str]:
     _, local_to_global = _parse_all_sources(sections)
@@ -328,39 +301,117 @@ def _normalize_citations_in_drafts(drafts: Dict[str, str], sections: Dict[str, A
     return normalized
 
 
+
+def _source_identity(title: str, url: str) -> str:
+    normalized_url = (url or "").strip().rstrip(".,;，。；)）]】").lower()
+    if normalized_url:
+        return f"url:{normalized_url}"
+    normalized_title = re.sub(r"\s+", " ", title or "").strip().lower()
+    return f"title:{normalized_title}"
+
+
+def _extract_cited_ids(report: str) -> set:
+    return set(re.findall(r"(?<!\!)\[(\d+)\]", report or ""))
+
+
+def _sort_numeric_strings(values: set) -> List[str]:
+    return sorted(values, key=lambda x: int(x) if x.isdigit() else x)
+
+
+def _validate_citation_consistency(report: str, source_list: List[Dict[str, str]]) -> Dict[str, List[str]]:
+    cited_ids = _extract_cited_ids(report)
+    source_ids = {src["id"] for src in source_list}
+    return {
+        "missing_references": _sort_numeric_strings(cited_ids - source_ids),
+        "unused_references": _sort_numeric_strings(source_ids - cited_ids),
+    }
+
+
+def _parse_all_sources(sections: Dict[str, Any]) -> tuple:
+    source_list: List[Dict[str, str]] = []
+    local_to_global: Dict[str, str] = {}
+    source_identity_to_global: Dict[str, str] = {}
+    global_counter = 0
+
+    for sec_title, sec in sections.items():
+        rd = getattr(sec, "research_data", "") or ""
+        blocks = re.split(r"\n(?=\[[^\]\n]*\d+\]\s*)", rd)
+        for block in blocks:
+            match = re.match(r"\[([^\]\n]*\d+)\]\s*(?:[^:\n：]{0,30})[:：]\s*(.+?)(?:\n|$)", block)
+            if not match:
+                continue
+
+            local_id = match.group(1).strip()
+            source_title = match.group(2).strip()
+            url_match = re.search(r"https?://\S+", block)
+            source_url = url_match.group(0).strip().rstrip(".,;，。；)）]】") if url_match else ""
+            identity = _source_identity(source_title, source_url)
+
+            if identity in source_identity_to_global:
+                global_id = source_identity_to_global[identity]
+                for src in source_list:
+                    if src["id"] == global_id:
+                        sections_used = src["section"].split(" / ")
+                        if sec_title not in sections_used:
+                            src["section"] = f'{src["section"]} / {sec_title}'
+                        break
+            else:
+                global_counter += 1
+                global_id = str(global_counter)
+                source_identity_to_global[identity] = global_id
+                source_list.append({
+                    "id": global_id,
+                    "title": source_title,
+                    "url": source_url,
+                    "section": sec_title,
+                })
+
+            mapping_key = f"{sec_title}|||{local_id}"
+            local_to_global[mapping_key] = global_id
+
+    return source_list, local_to_global
+
+
 def _replace_references_section(report: str, sections: Dict[str, Any]) -> str:
     source_list, _ = _parse_all_sources(sections)
     if not source_list:
         return report
 
+    cited_ids = _extract_cited_ids(report)
+    if cited_ids:
+        source_list = [src for src in source_list if src["id"] in cited_ids]
+
+    if not source_list:
+        return report
+
     lines: List[str] = []
-    lines.append('')
-    lines.append('---')
-    lines.append('')
-    lines.append('## 参考资料')
-    lines.append('')
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## 参考资料")
+    lines.append("")
 
     for src in source_list:
-        sid = src['id']
-        title = src['title']
-        url = src['url']
-        section = src['section']
+        sid = src["id"]
+        title = src["title"]
+        url = src["url"]
+        section = src["section"]
         if url:
             lines.append(f"- **[{sid}]** [{title}]({url})")
         else:
             lines.append(f"- **[{sid}]** {title}")
-        lines.append(f'  *章节：{section}*')
-        lines.append('')
-    lines.append('')
+        lines.append(f"  *章节：{section}*")
+        lines.append("")
+    lines.append("")
 
-    new_ref_block = '\n'.join(lines)
+    new_ref_block = "\n".join(lines)
 
-    ref_pattern = r'\n*#{1,3}\s*参考资料\s*\n.*?(?=\n#{1,3}\s|\Z)'
+    ref_pattern = r"\n*#{1,3}\s*(?:参考资料|å‚è€ƒèµ„æ–™)\s*\n.*?(?=\n#{1,3}\s|\Z)"
     ref_match = re.search(ref_pattern, report, re.DOTALL | re.IGNORECASE)
     if ref_match:
-        report = report[:ref_match.start()].rstrip() + '\n' + new_ref_block + '\n' + report[ref_match.end():].lstrip()
+        report = report[:ref_match.start()].rstrip() + "\n" + new_ref_block + "\n" + report[ref_match.end():].lstrip()
     else:
-        report = report.rstrip() + '\n' + new_ref_block + '\n'
+        report = report.rstrip() + "\n" + new_ref_block + "\n"
 
     return report
 
@@ -391,6 +442,13 @@ async def editor_node(state: ResearchState) -> ResearchState:
 
     print(f"    [Editor] 正在整合 {len(drafts)} 个章节并生成最终报告...")
     final_report = await run_editor_async(topic, drafts, conflict_resolutions)
+
+    source_list, _ = _parse_all_sources(state.sections)
+    citation_check = _validate_citation_consistency(final_report, source_list)
+    if citation_check["missing_references"]:
+        print(f"    [Editor] 引用校验警告：正文引用了不存在的来源编号 {citation_check['missing_references']}")
+    if citation_check["unused_references"]:
+        print(f"    [Editor] 引用校验提示：以下来源未被正文实际引用 {citation_check['unused_references']}")
 
     final_report = _replace_references_section(final_report, state.sections)
 
