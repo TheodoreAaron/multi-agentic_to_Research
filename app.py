@@ -27,6 +27,11 @@ with st.sidebar:
         value=False,
         help="开启后会在本次调研流程生成最终研报后实际运行 RAGAS Faithfulness 评估；关闭时不会运行评估程序。"
     )
+    enable_initial_draft_evaluation = st.checkbox(
+        "开启初稿版报告 + RAGAS 评估",
+        value=False,
+        help="开启后会在 Analyst 首次生成各章节草稿后，让 Editor 另外组装一份初稿版报告并运行 RAGAS Faithfulness 评估。"
+    )
     start_btn = st.button("🚀 开始生成", type="primary", use_container_width=True)
     
     st.divider()
@@ -43,9 +48,17 @@ with st.sidebar:
 # ==========================================
 # 异步执行函数 (用于流式捕获节点状态)
 # ==========================================
-async def run_workflow(topic: str, enable_ragas_evaluation: bool = False):
+async def run_workflow(
+    topic: str,
+    enable_ragas_evaluation: bool = False,
+    enable_initial_draft_evaluation: bool = False,
+):
     # 使用重构后的面向对象 State
-    initial_state = ResearchState(topic=topic, enable_ragas_evaluation=enable_ragas_evaluation)
+    initial_state = ResearchState(
+        topic=topic,
+        enable_ragas_evaluation=enable_ragas_evaluation,
+        enable_initial_draft_evaluation=enable_initial_draft_evaluation,
+    )
 
     # 创建一个状态容器占位符
     status_container = st.empty()
@@ -81,6 +94,15 @@ async def run_workflow(topic: str, enable_ragas_evaluation: bool = False):
                     msg = "✅ **Reviewer** 审查通过！所有章节数据支撑充分，无逻辑矛盾。"
             elif node_name == "editor":
                 msg = "✨ **Editor** 节点执行完毕。最终长报告整合完成！"
+            elif node_name == "initial_draft_editor":
+                msg = "📝 **Initial Draft Editor** 节点执行完毕。初稿版报告已组装完成。"
+            elif node_name == "initial_draft_ragas_evaluator":
+                score = state_get(state_updates, 'initial_draft_faithfulness_score')
+                error = state_get(state_updates, 'initial_draft_faithfulness_error', '')
+                if score is not None:
+                    msg = f"📊 **Initial Draft RAGAS Evaluator** 执行完毕。Faithfulness = {score:.4f}"
+                else:
+                    msg = f"⚠️ **Initial Draft RAGAS Evaluator** 执行失败：{error}"
             elif node_name == "ragas_evaluator":
                 score = state_get(state_updates, 'faithfulness_score')
                 error = state_get(state_updates, 'faithfulness_error', '')
@@ -118,7 +140,13 @@ if start_btn:
         
         # 运行异步图逻辑
         with st.spinner("系统初始化中..."):
-            final_result = asyncio.run(run_workflow(topic, enable_ragas_evaluation))
+            final_result = asyncio.run(
+                run_workflow(
+                    topic,
+                    enable_ragas_evaluation,
+                    enable_initial_draft_evaluation,
+                )
+            )
 
         report_md = ""
         if final_result:
@@ -127,6 +155,9 @@ if start_btn:
             revision_count = state_get(final_result, 'revision_count', 0)
             faithfulness_score = state_get(final_result, 'faithfulness_score')
             faithfulness_error = state_get(final_result, 'faithfulness_error', '')
+            initial_draft_report = state_get(final_result, 'initial_draft_report', '')
+            initial_draft_faithfulness_score = state_get(final_result, 'initial_draft_faithfulness_score')
+            initial_draft_faithfulness_error = state_get(final_result, 'initial_draft_faithfulness_error', '')
 
             try:
                 append_workflow_summary(topic, topic, len(sections), revision_count, len(report_md))
@@ -143,6 +174,29 @@ if start_btn:
                     st.metric("RAGAS Faithfulness", f"{faithfulness_score:.4f}")
                 else:
                     st.warning(f"RAGAS Faithfulness 评估未产出分数：{faithfulness_error}")
+
+            if enable_initial_draft_evaluation and initial_draft_report:
+                st.subheader("初稿版报告对照")
+                if initial_draft_faithfulness_score is not None:
+                    st.metric("Initial Draft RAGAS Faithfulness", f"{initial_draft_faithfulness_score:.4f}")
+                else:
+                    st.warning(f"初稿版 RAGAS Faithfulness 评估未产出分数：{initial_draft_faithfulness_error}")
+
+                st.download_button(
+                    label="下载初稿版 Markdown 报告",
+                    data=initial_draft_report,
+                    file_name="initial_draft_report.md",
+                    mime="text/markdown"
+                )
+
+                try:
+                    with open("initial_draft_report.md", "w", encoding="utf-8") as f:
+                        f.write(initial_draft_report)
+                except Exception as e:
+                    st.warning(f"初稿版报告本地保存失败: {e}")
+
+                with st.expander("查看初稿版报告", expanded=False):
+                    st.markdown(initial_draft_report)
             
             # 下载按钮
             st.download_button(

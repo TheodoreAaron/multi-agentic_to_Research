@@ -43,6 +43,11 @@ Main endpoints:
 - `GET /research/{task_id}/report`: fetch the generated report
 - `GET /research/{task_id}/events`: stream progress with Server-Sent Events
 
+`POST /research` accepts two independent evaluation switches:
+
+- `enable_ragas_evaluation`: evaluate the final edited report
+- `enable_initial_draft_evaluation`: assemble and evaluate the first-draft report before Reviewer revisions
+
 The first FastAPI version stores task state in memory. For production usage,
 replace the in-memory task table with Redis or a database, and run long jobs
 through a task queue such as Celery or RQ.
@@ -55,6 +60,7 @@ Multi-agent deep research/report generator built with LangGraph.
 - Streamlit UI with streaming node logs and Markdown export
 - Web search via Tavily; optional RAG context via Milvus Lite + sentence-transformers (auto-fallback when embeddings aren’t available)
 - Optional RAGAS Faithfulness evaluation for the final report
+- Optional first-draft report module: freezes each section's first Analyst draft, asks Editor to assemble a comparison report, then runs RAGAS Faithfulness on that first-draft report
 
 ## Quickstart
 1. Create virtualenv and install deps:

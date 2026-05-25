@@ -24,6 +24,10 @@ class ResearchRequest(BaseModel):
         default=False,
         description="Whether to run RAGAS faithfulness evaluation after report generation",
     )
+    enable_initial_draft_evaluation: bool = Field(
+        default=False,
+        description="Whether to assemble first section drafts into a report and run RAGAS faithfulness",
+    )
 
 
 class ResearchCreateResponse(BaseModel):
@@ -39,6 +43,9 @@ class TaskSnapshot(BaseModel):
     final_report: Optional[str] = None
     faithfulness_score: Optional[float] = None
     faithfulness_error: str = ""
+    initial_draft_report: Optional[str] = None
+    initial_draft_faithfulness_score: Optional[float] = None
+    initial_draft_faithfulness_error: str = ""
     error: Optional[str] = None
     created_at: str
     updated_at: str
@@ -94,6 +101,14 @@ def _node_message(node_name: str, state: Any) -> str:
         return "Reviewer completed. All sections passed review."
     if node_name == "editor":
         return "Editor completed. Final report was assembled."
+    if node_name == "initial_draft_editor":
+        return "Initial-draft editor completed. First-draft report was assembled."
+    if node_name == "initial_draft_ragas_evaluator":
+        score = _state_get(state, "initial_draft_faithfulness_score")
+        error = _state_get(state, "initial_draft_faithfulness_error", "")
+        if score is not None:
+            return f"Initial-draft RAGAS evaluator completed. Faithfulness={score:.4f}"
+        return f"Initial-draft RAGAS evaluator failed or skipped score generation: {error}"
     if node_name == "ragas_evaluator":
         score = _state_get(state, "faithfulness_score")
         error = _state_get(state, "faithfulness_error", "")
@@ -113,6 +128,7 @@ async def _run_research_task(task_id: str, request: ResearchRequest) -> None:
         initial_state = ResearchState(
             topic=request.topic.strip(),
             enable_ragas_evaluation=request.enable_ragas_evaluation,
+            enable_initial_draft_evaluation=request.enable_initial_draft_evaluation,
         )
         final_state: Any = None
 
@@ -135,6 +151,19 @@ async def _run_research_task(task_id: str, request: ResearchRequest) -> None:
                     "faithfulness_error",
                     task.get("faithfulness_error", ""),
                 )
+                initial_draft_report = _state_get(state_update, "initial_draft_report", "")
+                if initial_draft_report:
+                    task["initial_draft_report"] = initial_draft_report
+                task["initial_draft_faithfulness_score"] = _state_get(
+                    state_update,
+                    "initial_draft_faithfulness_score",
+                    task.get("initial_draft_faithfulness_score"),
+                )
+                task["initial_draft_faithfulness_error"] = _state_get(
+                    state_update,
+                    "initial_draft_faithfulness_error",
+                    task.get("initial_draft_faithfulness_error", ""),
+                )
 
         if final_state is not None:
             task["final_report"] = _state_get(
@@ -151,6 +180,21 @@ async def _run_research_task(task_id: str, request: ResearchRequest) -> None:
                 final_state,
                 "faithfulness_error",
                 task.get("faithfulness_error", ""),
+            )
+            task["initial_draft_report"] = _state_get(
+                final_state,
+                "initial_draft_report",
+                task.get("initial_draft_report"),
+            )
+            task["initial_draft_faithfulness_score"] = _state_get(
+                final_state,
+                "initial_draft_faithfulness_score",
+                task.get("initial_draft_faithfulness_score"),
+            )
+            task["initial_draft_faithfulness_error"] = _state_get(
+                final_state,
+                "initial_draft_faithfulness_error",
+                task.get("initial_draft_faithfulness_error", ""),
             )
 
         task["status"] = "completed"
@@ -183,6 +227,9 @@ async def create_research(
         "final_report": None,
         "faithfulness_score": None,
         "faithfulness_error": "",
+        "initial_draft_report": None,
+        "initial_draft_faithfulness_score": None,
+        "initial_draft_faithfulness_error": "",
         "error": None,
         "created_at": now,
         "updated_at": now,
@@ -215,6 +262,9 @@ async def get_report(task_id: str, as_markdown: bool = False):
         "final_report": report,
         "faithfulness_score": task.get("faithfulness_score"),
         "faithfulness_error": task.get("faithfulness_error", ""),
+        "initial_draft_report": task.get("initial_draft_report"),
+        "initial_draft_faithfulness_score": task.get("initial_draft_faithfulness_score"),
+        "initial_draft_faithfulness_error": task.get("initial_draft_faithfulness_error", ""),
     }
 
 

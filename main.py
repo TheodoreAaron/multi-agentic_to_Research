@@ -222,6 +222,8 @@ async def analyst_node(state: ResearchState) -> ResearchState:
     
     for sec_title, draft in results:
         sec = state.sections[sec_title]
+        if not sec.initial_draft:
+            sec.initial_draft = draft
         sec.draft = draft
         sec.critique = ""
         sec.is_approved = False
@@ -463,6 +465,64 @@ async def editor_node(state: ResearchState) -> ResearchState:
     return state
 
 
+async def initial_draft_editor_node(state: ResearchState) -> ResearchState:
+    print("\n--> node: initial_draft_editor")
+    topic = state.topic
+
+    drafts = {
+        title: sec.initial_draft
+        for title, sec in state.sections.items()
+        if getattr(sec, "initial_draft", "")
+    }
+    drafts = _normalize_citations_in_drafts(drafts, state.sections)
+
+    print(f"    [InitialDraftEditor] assembling first-draft report from {len(drafts)} sections...")
+    initial_report = await run_editor_async(topic, drafts)
+
+    source_list, _ = _parse_all_sources(state.sections)
+    citation_check = _validate_citation_consistency(initial_report, source_list)
+    if citation_check["missing_references"]:
+        print(
+            "    [InitialDraftEditor] citation warning: "
+            f"missing source ids {citation_check['missing_references']}"
+        )
+
+    state.initial_draft_report = _replace_references_section(initial_report, state.sections)
+
+    try:
+        append_editor_log(topic, topic, state.initial_draft_report, len(drafts))
+    except Exception as e:
+        print(f"    [InitialDraftEditor] log failed: {e}")
+
+    print("    [InitialDraftEditor] first-draft report assembled.")
+    return state
+
+
+async def initial_draft_ragas_evaluator_node(state: ResearchState) -> ResearchState:
+    print("\n--> node: initial_draft_ragas_evaluator")
+    contexts = _build_evaluation_contexts(state.sections)
+    try:
+        state.initial_draft_faithfulness_score = await evaluate_faithfulness(
+            user_input=f"{state.topic} first-draft report",
+            response=state.initial_draft_report,
+            retrieved_contexts=contexts,
+        )
+        state.initial_draft_faithfulness_error = ""
+        print(
+            "    [InitialDraftRAGAS] Faithfulness evaluation complete: "
+            f"{state.initial_draft_faithfulness_score:.4f}"
+        )
+    except RagasEvaluationError as e:
+        state.initial_draft_faithfulness_score = None
+        state.initial_draft_faithfulness_error = str(e)
+        print(f"    [InitialDraftRAGAS] Faithfulness evaluation failed: {e}")
+    except Exception as e:
+        state.initial_draft_faithfulness_score = None
+        state.initial_draft_faithfulness_error = f"RAGAS evaluation runtime error: {e}"
+        print(f"    [InitialDraftRAGAS] Faithfulness evaluation error: {e}")
+    return state
+
+
 async def ragas_evaluator_node(state: ResearchState) -> ResearchState:
     print("\n--> 节点执行: ragas_evaluator")
     contexts = _build_evaluation_contexts(state.sections)
@@ -485,6 +545,19 @@ async def ragas_evaluator_node(state: ResearchState) -> ResearchState:
     return state
 
 # 条件路由逻辑
+def should_run_initial_draft_module(state: ResearchState) -> str:
+    if not state.enable_initial_draft_evaluation:
+        return "reviewer"
+    if state.initial_draft_report:
+        return "reviewer"
+    if not state.sections:
+        return "reviewer"
+    if all(getattr(sec, "initial_draft", "") for sec in state.sections.values()):
+        print("    [route] initial draft evaluation enabled; going to initial_draft_editor")
+        return "initial_draft_editor"
+    return "reviewer"
+
+
 def should_revise(state: ResearchState) -> str:
     # 检查是否有未通过且带有 critique 的章节
     has_critique = any(sec.critique for sec in state.sections.values() if not sec.is_approved)
@@ -525,6 +598,8 @@ workflow = StateGraph(ResearchState)
 workflow.add_node("planner", planner_node)
 workflow.add_node("researcher", researcher_node)
 workflow.add_node("analyst", analyst_node)
+workflow.add_node("initial_draft_editor", initial_draft_editor_node)
+workflow.add_node("initial_draft_ragas_evaluator", initial_draft_ragas_evaluator_node)
 workflow.add_node("reviewer", reviewer_node)
 workflow.add_node("editor", editor_node)
 workflow.add_node("ragas_evaluator", ragas_evaluator_node)
@@ -532,7 +607,16 @@ workflow.add_node("ragas_evaluator", ragas_evaluator_node)
 workflow.add_edge(START, "planner")
 workflow.add_edge("planner", "researcher")
 workflow.add_edge("researcher", "analyst")
-workflow.add_edge("analyst", "reviewer")
+workflow.add_conditional_edges(
+    "analyst",
+    should_run_initial_draft_module,
+    {
+        "initial_draft_editor": "initial_draft_editor",
+        "reviewer": "reviewer",
+    }
+)
+workflow.add_edge("initial_draft_editor", "initial_draft_ragas_evaluator")
+workflow.add_edge("initial_draft_ragas_evaluator", "reviewer")
 
 workflow.add_conditional_edges(
     "reviewer",
