@@ -7,3 +7,5 @@ aiohttp
 streamlit
 ragas
 openai
+fastapi
+uvicorn

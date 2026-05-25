@@ -8,8 +8,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from tavily import TavilyClient
-from pymilvus import MilvusClient
-from sentence_transformers import SentenceTransformer
 
 # ==========================================
 # 1. 配置日志记录
@@ -122,6 +120,8 @@ class MilvusRAGHelper:
     """
     def __init__(self, db_path: str = "./milvus_local.db", embedding_model_name: str = "all-MiniLM-L6-v2"):
         # 使用本地文件作为 Milvus Lite 存储
+        from pymilvus import MilvusClient
+
         self.client = MilvusClient(db_path)
 
         self.model = None
@@ -129,6 +129,8 @@ class MilvusRAGHelper:
         try:
             # 使用轻量级 SentenceTransformer 模型
             logger.info(f"正在加载 Embedding 模型 ({embedding_model_name})...")
+            from sentence_transformers import SentenceTransformer
+
             self.model = SentenceTransformer(embedding_model_name)
             # 尽量从模型读取维度，读不到就回退到默认值
             if hasattr(self.model, "get_sentence_embedding_dimension"):

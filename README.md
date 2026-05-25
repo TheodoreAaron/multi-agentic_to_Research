@@ -1,5 +1,52 @@
 # DeepResearch-MAS
 
+## FastAPI API
+
+This project can run the existing LangGraph workflow through a thin FastAPI
+wrapper without changing the core agents.
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Start the API service:
+
+```bash
+python run_api.py
+```
+
+Verify the FastAPI wrapper without importing heavy runtime dependencies:
+
+```bash
+python verify_api.py
+```
+
+After all project dependencies are installed, run the stricter import check:
+
+```bash
+python verify_api.py --runtime
+```
+
+Open the API docs:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+Main endpoints:
+
+- `GET /health`: health check
+- `POST /research`: submit a research task
+- `GET /research/{task_id}`: inspect task status and progress
+- `GET /research/{task_id}/report`: fetch the generated report
+- `GET /research/{task_id}/events`: stream progress with Server-Sent Events
+
+The first FastAPI version stores task state in memory. For production usage,
+replace the in-memory task table with Redis or a database, and run long jobs
+through a task queue such as Celery or RQ.
+
 Multi-agent deep research/report generator built with LangGraph.
 
 ## Features

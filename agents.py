@@ -4,6 +4,8 @@ import asyncio
 from typing import Dict, Any, List, Tuple
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
 from dotenv import load_dotenv
 
 from tools import tool_manager, web_search
@@ -222,7 +224,7 @@ REACT_SYSTEM_PROMPT = """你是一个深度研究搜索智能体（Researcher Ag
 - 结束搜索：{"action": "finish", "summary": "简要总结已收集资料的关键发现"}"""
 
 
-async def run_researcher_async(topic: str, section_title: str, max_hops: int = 4) -> Tuple[List[Dict[str, Any]], str]:
+async def _run_researcher_async_legacy(topic: str, section_title: str, max_hops: int = 4) -> Tuple[List[Dict[str, Any]], str]:
     """
     ReAct Agent: 多跳搜索研究器
     通过 Reasoning + Acting 循环进行多轮深层搜索，逐步深入主题的各维度。
@@ -318,6 +320,102 @@ async def run_researcher_async(topic: str, section_title: str, max_hops: int = 4
 
     formatted_data = "\n".join(formatted_parts)
     print(f"    [ReAct] 多跳搜索完成，共执行 {min(hop + 1, max_hops)} 轮，收集 {source_index - 1} 条去重资料。")
+    return all_results, formatted_data
+
+async def run_researcher_async(topic: str, section_title: str, max_hops: int = 4) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Framework-driven ReAct researcher.
+
+    This overrides the legacy hand-written ReAct loop above while preserving the
+    same public contract used by main.py:
+    (raw search results, formatted research data).
+    """
+    all_results: List[Dict[str, Any]] = []
+    search_count = 0
+
+    @tool
+    def researcher_web_search(query: str, max_results: int = 5) -> str:
+        """Search web information for the current deep-research section."""
+        nonlocal search_count
+        if search_count >= max_hops:
+            return json.dumps(
+                {
+                    "status": "limit_reached",
+                    "message": f"Search limit reached: {max_hops} calls.",
+                },
+                ensure_ascii=False,
+            )
+
+        search_count += 1
+        print(f"    [ReAct] framework tool search {search_count}/{max_hops}: {query}")
+        try:
+            results = web_search(query, max_results=max_results)
+        except Exception as e:
+            print(f"    [ReAct] search failed: {e}")
+            return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
+
+        all_results.extend(results)
+        return json.dumps({"status": "success", "results": results}, ensure_ascii=False)
+
+    framework_prompt = (
+        "You are a deep-research search agent following the ReAct pattern. "
+        "Your task is to collect comprehensive web material for one report section. "
+        "Use the researcher_web_search tool when more evidence is needed. "
+        "Do not output JSON action commands. The framework will execute tool calls for you. "
+        "Search from different angles: background, technical details, cases/data, debates, and recent progress. "
+        "Each search query should be specific and should avoid repeating previous searches. "
+        "When enough material has been collected, stop using tools and summarize the key findings."
+    )
+
+    agent = create_react_agent(
+        model=llm,
+        tools=[researcher_web_search],
+        prompt=framework_prompt,
+    )
+
+    user_prompt = (
+        f"Research topic: {topic}\n"
+        f"Current section: {section_title}\n"
+        f"Use researcher_web_search for up to {max_hops} focused searches. "
+        "Start from core concepts or background, then explore different angles. "
+        "When the collected material is sufficient, stop calling tools and summarize the key findings."
+    )
+
+    print(f"    [ReAct] framework agent started, max search calls: {max_hops}")
+    try:
+        await agent.ainvoke(
+            {"messages": [HumanMessage(content=user_prompt)]},
+            config={"recursion_limit": max_hops * 4 + 6},
+        )
+    except Exception as e:
+        print(f"    [ReAct] framework agent failed: {e}")
+
+    source_index = 1
+    formatted_parts = [
+        f"以下是关于【{section_title}】的多跳深度搜索结果（共 {len(all_results)} 条原始资料）：\n"
+    ]
+    seen_urls = set()
+    for res in all_results:
+        url = res.get("url", "")
+        if url and url in seen_urls:
+            continue
+        if url:
+            seen_urls.add(url)
+
+        title = res.get("title", "无标题")
+        content = res.get("content", "无摘要内容")
+        formatted_parts.append(
+            f"[数据源{source_index}] 标题: {title}\n"
+            f"内容: {content}\n"
+            f"来源链接: {url}\n"
+        )
+        source_index += 1
+
+    formatted_data = "\n".join(formatted_parts)
+    print(
+        f"    [ReAct] framework search complete, tool calls: {search_count}, "
+        f"unique sources: {source_index - 1}."
+    )
     return all_results, formatted_data
 
 
